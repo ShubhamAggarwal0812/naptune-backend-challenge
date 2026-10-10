@@ -1,0 +1,12 @@
+[project]
+name = "payguard"
+version = "0.1.0"
+description = "Naptune backend challenge: deciding, executing and verifying an AI agent's payment"
+requires-python = ">=3.11"
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
