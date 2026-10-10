@@ -30,6 +30,9 @@ MAX_AGE: dict[str, timedelta] = {
     "compliance": timedelta(hours=1),
 }
 
+# A source dated later than this past our clock can't be trusted about its age.
+CLOCK_SKEW = timedelta(seconds=30)
+
 # Why old data from a source is a problem, shown to whoever reviews a hold.
 STALE_MEANS = {
     "duplicate_check": "a payment made in that window would not show",
@@ -89,6 +92,12 @@ def assess(req: PaymentRequest, evidence: Mapping[str, Observation], now: dateti
             if obs is not None and obs.as_of is not None:
                 last = f"; last result {dict(obs.data)} is {_age(now - obs.as_of)} old"
             hold("UNAVAILABLE", f"{source} is unavailable{last}{why}")
+            return None
+        if obs.as_of is not None and obs.as_of - now > CLOCK_SKEW:
+            hold(
+                "FUTURE_TIMESTAMP",
+                f"{source} data is dated {_age(obs.as_of - now)} in the future; its clock or ours is wrong",
+            )
             return None
         if obs.as_of is None or now - obs.as_of > MAX_AGE[source]:
             age = f"{_age(now - obs.as_of)} old" if obs.as_of else "undated"
@@ -161,7 +170,7 @@ def assess(req: PaymentRequest, evidence: Mapping[str, Observation], now: dateti
 
 
 def inr(paise: int) -> str:
-    """Rupees with Indian digit grouping: 84000000 -> ₹8,40,000."""
+    """Rupees with Indian digit grouping: 84000000 -> ₹8,40,000, 84000050 -> ₹8,40,000.50."""
     digits = str(paise // 100)
     head, tail = digits[:-3], digits[-3:]
     groups = []
@@ -170,7 +179,8 @@ def inr(paise: int) -> str:
         head = head[:-2]
     if head:
         groups.insert(0, head)
-    return "₹" + ",".join(groups + [tail])
+    rupees = "₹" + ",".join(groups + [tail])
+    return rupees + (f".{paise % 100:02d}" if paise % 100 else "")
 
 
 def _age(delta: timedelta) -> str:

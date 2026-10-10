@@ -30,6 +30,8 @@ def main() -> None:
         for reason in svc.store.history(p.id)[-1]["detail"]["reasons"]:
             print(f"  {reason['code']:<26} {reason['detail']}")
         print(f"provider calls: {len(provider.pay_calls)}")
+        queued = [item["invoice_id"] for item in svc.review_queue()]
+        print(f"review queue (because of the bank change): {queued}")
 
         step("Gaps closed (bank change withdrawn after a call-back, duplicate check caught up, "
              "compliance back). Agent re-sends; the provider executes but the response times out")

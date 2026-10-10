@@ -43,6 +43,7 @@ class FakeProvider:
       timeout_before  times out before the request reaches the provider (nothing executed)
       timeout_after   executes, then the response is lost (Case B)
       crash_after     executes, then our process dies before reading the response
+      failed          executes, then reports it failed
       reject          definitively refuses
     """
 
@@ -60,8 +61,9 @@ class FakeProvider:
             return ProviderStatus("REJECTED")
         if key not in self.executed:  # same key again returns the original payment
             ref = f"UTR{len(self.executed) + 1:06d}"
+            state = "FAILED" if self.mode == "failed" else "ACCEPTED"
             self.executed[key] = {
-                "ref": ref, "state": "ACCEPTED", "amount_paise": amount_paise, "account": account,
+                "ref": ref, "state": state, "amount_paise": amount_paise, "account": account,
             }
         if self.mode == "timeout_after":
             raise ProviderTimeout("no response within 8s")
@@ -83,7 +85,8 @@ class FakeDownstream:
     def __init__(self) -> None:
         self.ledger = "PENDING"
         self.settlement_up = False
-        self.debits: dict[str, int] = {}  # provider ref -> amount debited from our account
+        self.debits: dict[str, int] = {}   # provider ref -> amount debited from our account
+        self.returns: dict[str, int] = {}  # provider ref -> amount credited back to us
 
     def ledger_status(self, invoice_id: str) -> str:
         return self.ledger
@@ -95,3 +98,6 @@ class FakeDownstream:
 
     def bank_debit(self, ref: str) -> int | None:
         return self.debits.get(ref)
+
+    def bank_return(self, ref: str) -> int | None:
+        return self.returns.get(ref)

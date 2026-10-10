@@ -49,18 +49,22 @@ def test_same_invoice_with_a_different_amount_is_refused(world):
     assert world.provider.pay_calls == [KEY]
 
 
-def test_two_workers_holding_the_same_row_only_one_can_move_it(world):
-    """Both copies arrive at once and both workers read the same row. The compare-and-set on
-    `version` lets exactly one of them move it to SUBMITTING, so only one calls the provider."""
-    world.evidence.build = brief_evidence
-    svc = world.start()
-    seen_by_both = svc.handle(REQUEST)  # HELD, same version for both workers
+def test_two_copies_racing_send_only_once(world):
+    """The second copy runs start to finish while the first is still gathering evidence, so
+    both decide from the same row. Only the compare-and-set winner may call the provider."""
+    first, second = world.start(), world.start()
+    raced = []
 
-    worker_a = svc.store.transition(seen_by_both, State.SUBMITTING, {}, world.clock())
-    worker_b = svc.store.transition(seen_by_both, State.SUBMITTING, {}, world.clock())
+    def evidence_while_the_other_copy_runs(req):
+        if not raced:
+            raced.append(True)
+            second.handle(REQUEST)
+        return resolved_evidence(world.clock())
 
-    assert worker_a is not None
-    assert worker_b is None
+    first.evidence = evidence_while_the_other_copy_runs
+    first.handle(REQUEST)
+
+    assert world.provider.pay_calls == [KEY]
 
 
 # --- Case B: the provider executes but the response times out ------------------
@@ -181,7 +185,8 @@ def test_provider_success_is_not_settlement(world):
     status = svc.status("INV-8842")
     assert status["state"] == State.PROVIDER_ACCEPTED
     assert status["sources"] == {
-        "provider": "ACCEPTED", "ledger": "PENDING", "settlement": "UNAVAILABLE", "bank_debit": "NOT_SEEN",
+        "provider": "ACCEPTED", "ledger": "PENDING", "settlement": "UNAVAILABLE",
+        "bank_debit": "NOT_SEEN", "bank_return": "NOT_SEEN",
     }
 
     world.provider.executed[KEY]["state"] = "SETTLED"  # the provider's word alone still isn't enough

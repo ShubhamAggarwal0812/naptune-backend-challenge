@@ -3,6 +3,9 @@
 SQLite stands in for Postgres. What carries over: invoice_id is UNIQUE, and
 every state change is a compare-and-set on `version`, written in the same
 transaction as its audit event.
+
+Each worker or thread opens its own Store. SQLite connections refuse to be
+shared across threads, and that check is kept on purpose.
 """
 
 from __future__ import annotations
@@ -37,19 +40,21 @@ SCHEMA = """
 CREATE TABLE IF NOT EXISTS payments (
     id              INTEGER PRIMARY KEY,
     version         INTEGER NOT NULL DEFAULT 0,
-    invoice_id      TEXT NOT NULL UNIQUE,   -- one payment per invoice
-    fingerprint     TEXT NOT NULL,          -- what was asked for: supplier + amount
+    invoice_id      TEXT NOT NULL UNIQUE,   -- one payment per invoice (procurement's own ids)
     idempotency_key TEXT NOT NULL UNIQUE,   -- sent to the provider on every attempt
     supplier_id     TEXT NOT NULL,
     amount_paise    INTEGER NOT NULL,
+    agent_id        TEXT NOT NULL,
     payee_account   TEXT,                   -- from the vendor master at decision time
     state           TEXT NOT NULL,
     provider_ref    TEXT,
     submitted_at    TEXT,
     accepted_at     TEXT,
     view            TEXT,                   -- latest per-source observations (Part 3)
-    updated_at      TEXT NOT NULL
+    created_at      TEXT NOT NULL,
+    updated_at      TEXT NOT NULL           -- time of the last state change
 );
+CREATE INDEX IF NOT EXISTS payments_by_state ON payments (state);
 CREATE TABLE IF NOT EXISTS events (
     id          INTEGER PRIMARY KEY,
     payment_id  INTEGER NOT NULL REFERENCES payments(id),
@@ -58,6 +63,7 @@ CREATE TABLE IF NOT EXISTS events (
     to_state    TEXT NOT NULL,
     detail      TEXT NOT NULL
 );
+CREATE INDEX IF NOT EXISTS events_by_payment ON events (payment_id);
 """
 
 
@@ -70,10 +76,10 @@ class Payment:
     id: int
     version: int
     invoice_id: str
-    fingerprint: str
     idempotency_key: str
     supplier_id: str
     amount_paise: int
+    agent_id: str
     payee_account: str | None
     state: State
     provider_ref: str | None
@@ -81,10 +87,14 @@ class Payment:
     accepted_at: datetime | None
     updated_at: datetime
     view: dict[str, Any] | None
+    created_at: datetime
 
 
 class Store:
-    _SETTABLE = frozenset({"payee_account", "provider_ref", "submitted_at", "accepted_at"})
+    _SETTABLE = frozenset({
+        "supplier_id", "amount_paise", "agent_id",  # a newer request, before anything was sent
+        "payee_account", "provider_ref", "submitted_at", "accepted_at",
+    })
 
     def __init__(self, path: Path | str) -> None:
         self.conn = sqlite3.connect(path)
@@ -96,17 +106,17 @@ class Store:
         invoice_id: str,
         supplier_id: str,
         amount_paise: int,
-        fingerprint: str,
+        agent_id: str,
         idempotency_key: str,
         now: datetime,
     ) -> Payment:
         try:
             with self.conn:
                 cur = self.conn.execute(
-                    "INSERT INTO payments (invoice_id, fingerprint, idempotency_key, supplier_id,"
-                    " amount_paise, state, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?)",
-                    (invoice_id, fingerprint, idempotency_key, supplier_id, amount_paise,
-                     State.NEW, now.isoformat()),
+                    "INSERT INTO payments (invoice_id, idempotency_key, supplier_id, amount_paise,"
+                    " agent_id, state, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    (invoice_id, idempotency_key, supplier_id, amount_paise, agent_id,
+                     State.NEW, now.isoformat(), now.isoformat()),
                 )
                 detail = {"supplier_id": supplier_id, "amount_paise": amount_paise}
                 self._event(cur.lastrowid, None, State.NEW, detail, now)
@@ -190,10 +200,10 @@ def _payment(row: sqlite3.Row) -> Payment:
         id=row["id"],
         version=row["version"],
         invoice_id=row["invoice_id"],
-        fingerprint=row["fingerprint"],
         idempotency_key=row["idempotency_key"],
         supplier_id=row["supplier_id"],
         amount_paise=row["amount_paise"],
+        agent_id=row["agent_id"],
         payee_account=row["payee_account"],
         state=State(row["state"]),
         provider_ref=row["provider_ref"],
@@ -201,4 +211,5 @@ def _payment(row: sqlite3.Row) -> Payment:
         accepted_at=when(row["accepted_at"]),
         updated_at=datetime.fromisoformat(row["updated_at"]),
         view=json.loads(row["view"]) if row["view"] else None,
+        created_at=datetime.fromisoformat(row["created_at"]),
     )
