@@ -5,31 +5,35 @@
 ```mermaid
 flowchart TD
     AGENT["AI agent<br/>PAY INV-8842 ₹8,40,000"] -->|"F1: same request twice"| INTAKE["Intake<br/>one row per invoice"]
-    INTAKE --> DECIDE["Decision engine<br/>evidence policy: owner + max age per fact"]
-    AUTH["Authority store<br/>limits, delegation"] --> DECIDE
 
-    subgraph SOURCES["Evidence sources: systems of record"]
+    subgraph EVIDENCE["Evidence: systems of record"]
         PROC["Procurement"]
         VENDOR["Vendor master"]
         DUP["Duplicate check"]
-        LEDGER["Ledger"]
+        BAL["Ledger balance"]
         COMP["Compliance"]
     end
-    SOURCES -->|"F2: stale, down or contradicting"| DECIDE
+
+    INTAKE --> DECIDE["Decision engine<br/>owner + max age per fact"]
+    AUTH["Authority store<br/>limits, delegation"] --> DECIDE
+    EVIDENCE -->|"F2: stale, down or contradicting"| DECIDE
 
     DECIDE -->|"HOLD / REJECT"| HUMAN["Human review queue"]
     DECIDE -->|"PROCEED"| EXEC["Executor"]
     EXEC -->|"1: write-ahead SUBMITTING + key<br/>F7: DB down"| DB[("Payments DB<br/>state + audit log")]
     EXEC -->|"2: pay with idempotency key<br/>F3: timeout, F4: crash"| PSP["Payment provider"]
 
-    RECOVER["Recovery and retry worker<br/>run_pending"] -->|"lookup by key"| PSP
-    RECOVER --> DB
+    DB --> RECOVER["Recovery worker<br/>run_pending"]
+    RECOVER -->|"lookup by key"| PSP
+    DB --> RECON["Reconciler"]
+    RECON -->|"F5: accepted, not settled"| PSP
 
-    RECON["Reconciler"] -->|"F5: accepted, not settled"| PSP
-    RECON --> BANK["Bank statement feed"]
-    RECON --> LEDGER
-    RECON --> SETTLE["Settlement system"]
-    RECON --> DB
+    subgraph PROOF["Did money move?"]
+        BANK["Bank statement feed"]
+        POSTINGS["Ledger postings"]
+        SETTLE["Settlement system"]
+    end
+    RECON --> PROOF
     RECON -->|"F6: never resolves"| HUMAN
 ```
 
