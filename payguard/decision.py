@@ -135,6 +135,8 @@ def assess(req: PaymentRequest, evidence: Mapping[str, Observation], now: dateti
                 "supplier asked to change its bank account and the change isn't approved; "
                 "confirm with the supplier out-of-band before paying",
             )
+        elif not vendor.get("verified_account"):
+            hold("NO_VERIFIED_ACCOUNT", f"vendor master has no verified bank account for {req.supplier_id}")
         else:
             payee = vendor["verified_account"]
 
@@ -154,6 +156,8 @@ def assess(req: PaymentRequest, evidence: Mapping[str, Observation], now: dateti
 
     verified["all_checks_complete"] = not reasons
     for claim, said in req.agent_claims.items():
+        if claim == "all_checks_complete" and not said:
+            continue  # the agent saying its own checks aren't done isn't a claim about the world
         if claim in verified and verified[claim] != said:
             hold(
                 "AGENT_CLAIM_CONTRADICTED",
@@ -170,7 +174,10 @@ def assess(req: PaymentRequest, evidence: Mapping[str, Observation], now: dateti
 
 
 def inr(paise: int) -> str:
-    """Rupees with Indian digit grouping: 84000000 -> ₹8,40,000, 84000050 -> ₹8,40,000.50."""
+    """Rupees with Indian digit grouping: 84000000 -> ₹8,40,000, -50 -> -₹0.50. Integer paise only."""
+    if not isinstance(paise, int):
+        raise TypeError(f"amounts are integer paise, got {paise!r}")
+    sign, paise = ("-", -paise) if paise < 0 else ("", paise)
     digits = str(paise // 100)
     head, tail = digits[:-3], digits[-3:]
     groups = []
@@ -179,16 +186,15 @@ def inr(paise: int) -> str:
         head = head[:-2]
     if head:
         groups.insert(0, head)
-    rupees = "₹" + ",".join(groups + [tail])
+    rupees = sign + "₹" + ",".join(groups + [tail])
     return rupees + (f".{paise % 100:02d}" if paise % 100 else "")
 
 
 def _age(delta: timedelta) -> str:
+    """Two units, so an age just over a limit never reads as equal to it: 2m59s, 1h59m, 1d3h."""
     seconds = int(delta.total_seconds())
-    if seconds < 60:
-        return f"{seconds}s"
-    if seconds < 3600:
-        return f"{seconds // 60}m"
-    if seconds < 86400:
-        return f"{seconds // 3600}h"
-    return f"{seconds // 86400}d"
+    for size, unit, next_size, next_unit in ((86400, "d", 3600, "h"), (3600, "h", 60, "m"), (60, "m", 1, "s")):
+        if seconds >= size:
+            rest = (seconds % size) // next_size
+            return f"{seconds // size}{unit}" + (f"{rest}{next_unit}" if rest else "")
+    return f"{seconds}s"

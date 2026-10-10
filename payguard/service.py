@@ -12,24 +12,29 @@ from .store import PRE_SUBMIT, DuplicateInvoice, Payment, State, Store
 CALL_TIMEOUT = timedelta(seconds=30)      # a SUBMITTING row older than this is not a live call
 UNKNOWN_DEADLINE = timedelta(minutes=30)  # after this, an unknown outcome goes to a person
 DEDUPE_WINDOW = timedelta(hours=24)       # how long the provider remembers keys (assumed)
+BANK_FEED_LAG = timedelta(hours=6)        # a debit shows in the bank feed within this (assumed)
 SETTLEMENT_DEADLINE = timedelta(days=1)   # NEFT/RTGS should settle well within T+1
 WATCH_WINDOW = timedelta(days=7)          # closed payments are re-checked this long for late news
-REVIEW_AFTER = timedelta(hours=4)         # a payment held this long joins the review queue
+REVIEW_AFTER = timedelta(hours=4)         # a payment stuck before sending this long joins the review queue
 
 # Resending is only safe while the provider still remembers the key.
 if UNKNOWN_DEADLINE >= DEDUPE_WINDOW:
     raise RuntimeError("UNKNOWN_DEADLINE must be shorter than the provider's DEDUPE_WINDOW")
 
 # Hold reasons a person should see straight away, not after REVIEW_AFTER.
-REVIEW_NOW = {"BANK_CHANGE_PENDING", "AGENT_CLAIM_CONTRADICTED", "FUTURE_TIMESTAMP"}
+REVIEW_NOW = {"BANK_CHANGE_PENDING", "NO_VERIFIED_ACCOUNT", "AGENT_CLAIM_CONTRADICTED", "FUTURE_TIMESTAMP"}
 
 # Provider answers meaning the payment reached it. Whether money moved is _reconcile()'s job.
 REACHED_PROVIDER = {"ACCEPTED", "SETTLED", "FAILED", "RETURNED"}
 DEFINITE_ANSWERS = REACHED_PROVIDER | {"REJECTED"}
-PROVIDER_FAILED = {"FAILED", "RETURNED"}
+FAILED_ANSWERS = {"FAILED", "RETURNED"}
 
-# States whose outcome can still change, so run_pending() keeps checking them.
-WATCHED = (State.PROVIDER_ACCEPTED, State.SETTLED, State.RETURNED, State.NEEDS_HUMAN)
+# Waiting on the bank: checked on every run until they resolve.
+OPEN = (State.PROVIDER_ACCEPTED, State.PROVIDER_FAILED)
+# Closed, or with a person: re-checked for WATCH_WINDOW in case the picture changes.
+CLOSED = (State.SETTLED, State.RETURNED, State.NEEDS_HUMAN)
+# Nothing automatic will move these again, so a person has to look.
+FOR_A_PERSON = (State.NEEDS_HUMAN, State.RETURNED, State.PROVIDER_REJECTED)
 
 LABELS = {
     State.NEW: "Received, not assessed yet.",
@@ -41,7 +46,11 @@ LABELS = {
         "Settlement pending: the provider has it, the bank hasn't confirmed the outcome. "
         "Do not retry or pay again."
     ),
-    State.PROVIDER_REJECTED: "The provider rejected it. No money moved.",
+    State.PROVIDER_FAILED: (
+        "The provider says it failed. Waiting for the bank to confirm no money left. "
+        "Do not retry or pay again."
+    ),
+    State.PROVIDER_REJECTED: "The provider rejected it. No money moved. A person decides what next.",
     State.SETTLED: "Paid: bank debit confirmed.",
     State.RETURNED: (
         "Failed or returned. Check the bank statement before anyone re-pays; "
@@ -65,6 +74,10 @@ class ProviderUnavailable(ProviderError):
 
 class ConflictingRequest(Exception):
     """A different supplier or amount for an invoice that was already sent."""
+
+
+class InvalidRequest(ValueError):
+    pass
 
 
 @dataclass(frozen=True)
@@ -104,6 +117,7 @@ class PaymentService:
 
     def handle(self, req: PaymentRequest) -> Payment:
         """Safe to call any number of times for the same invoice."""
+        _validate(req)
         p = self.store.get_by_invoice(req.invoice_id)
         if p is None:
             try:
@@ -122,20 +136,31 @@ class PaymentService:
         return p
 
     def _decide(self, p: Payment, req: PaymentRequest) -> Payment:
-        evidence = self.evidence(req)
+        # Whenever a transition below loses to another copy that changed the row while we decided,
+        # start again from what that copy did. A different amount already sent is then refused.
+        asked = {"supplier_id": req.supplier_id, "amount_paise": req.amount_paise, "agent_id": req.agent_id}
+        try:
+            evidence = self.evidence(req)
+        except Exception as e:
+            # Required evidence is unavailable. That's a hold, not an error that strands a NEW row.
+            reason = {"outcome": Outcome.NEED_MORE_EVIDENCE, "code": "UNAVAILABLE",
+                      "detail": f"gathering evidence failed: {e!r}"}
+            detail = {"decision": Outcome.NEED_MORE_EVIDENCE, "reasons": [reason]}
+            return self.store.transition(p, State.HELD, detail, self.clock(), **asked) or self.handle(req)
+
         now = self.clock()  # read after gathering, so evidence ages are measured at the decision
         decision = assess(req, evidence, now)
         detail = _decision_detail(decision, req, evidence)
-        asked = {"supplier_id": req.supplier_id, "amount_paise": req.amount_paise, "agent_id": req.agent_id}
-        if decision.outcome is Outcome.PROCEED:
-            # Write-ahead: SUBMITTING, the key and the payee are committed before the provider call.
-            sending = self.store.transition(
-                p, State.SUBMITTING, detail, now,
-                payee_account=decision.payee_account, submitted_at=now, **asked,
-            )
-            return self._send(sending) if sending else self.store.get(p.id)
-        to = State.REJECTED if decision.outcome is Outcome.REJECT else State.HELD
-        return self._move(p, to, detail, **asked)
+        if decision.outcome is not Outcome.PROCEED:
+            to = State.REJECTED if decision.outcome is Outcome.REJECT else State.HELD
+            return self.store.transition(p, to, detail, now, **asked) or self.handle(req)
+
+        # Write-ahead: SUBMITTING, the key and the payee are committed before the provider call.
+        sending = self.store.transition(
+            p, State.SUBMITTING, detail, now,
+            payee_account=decision.payee_account, submitted_at=now, **asked,
+        )
+        return self._send(sending) if sending else self.handle(req)
 
     # -- Sending ---------------------------------------------------------------
 
@@ -153,15 +178,10 @@ class PaymentService:
     def _record_provider_answer(self, p: Payment, status: ProviderStatus) -> Payment:
         if status.state == "REJECTED":
             return self._move(p, State.PROVIDER_REJECTED, {"provider": status.state})
-        accepted = self._move(
-            p, State.PROVIDER_ACCEPTED, {"provider": status.state, "ref": status.ref},
-            provider_ref=status.ref, accepted_at=self.clock(),
-        )
-        if status.state in PROVIDER_FAILED and accepted.state is State.PROVIDER_ACCEPTED:
-            # Don't show "settlement pending" for a payment the provider says failed: ask the bank now,
-            # using the answer we just got (a lookup straight after may not have caught up yet).
-            return self._reconcile(accepted, provider_said=status.state)
-        return accepted
+        # FAILED gets its own state: it's what the provider said, not yet what the bank shows.
+        to = State.PROVIDER_FAILED if status.state in FAILED_ANSWERS else State.PROVIDER_ACCEPTED
+        detail = {"provider": status.state, "ref": status.ref}
+        return self._move(p, to, detail, provider_ref=status.ref, accepted_at=self.clock())
 
     # -- Recovery: runs at startup and on a timer ------------------------------
 
@@ -185,10 +205,8 @@ class PaymentService:
         note = {"note": "found SUBMITTING after a restart; the call may have gone out"}
         each(stuck, lambda p: self._move(p, State.OUTCOME_UNKNOWN, note))
         each(self.store.in_state(State.OUTCOME_UNKNOWN), self._resolve_unknown)
-        watched = [
-            p for state in WATCHED for p in self.store.in_state(state)
-            if state is State.PROVIDER_ACCEPTED or now - p.updated_at <= WATCH_WINDOW
-        ]
+        watched = [p for state in OPEN for p in self.store.in_state(state)]
+        watched += [p for state in CLOSED for p in self.store.in_state(state, changed_since=now - WATCH_WINDOW)]
         each(watched, self._reconcile)
         return errors
 
@@ -211,6 +229,9 @@ class PaymentService:
         req = PaymentRequest(p.invoice_id, p.supplier_id, p.amount_paise, p.agent_id)
         evidence = self.evidence(req)
         decision = assess(req, evidence, self.clock())
+        codes = {r.code for r in decision.reasons}
+        if decision.outcome is Outcome.NEED_MORE_EVIDENCE and not codes & REVIEW_NOW:
+            return p  # a gap that may close on its own (stale or down data); try again until the deadline
         if decision.outcome is not Outcome.PROCEED or decision.payee_account != p.payee_account:
             # Not HELD: the first request may still land at the provider, so this isn't "nothing sent".
             why = "provider has no record and the evidence no longer supports sending it"
@@ -221,47 +242,52 @@ class PaymentService:
 
     # -- Part 3: did money really move? ----------------------------------------
 
-    def _reconcile(self, p: Payment, provider_said: str | None = None) -> Payment:
+    def _reconcile(self, p: Payment) -> Payment:
         """The provider accepting the instruction isn't money moving. The bank is the proof."""
-        if p.state not in WATCHED:
+        if p.state not in OPEN + CLOSED:
             return p
-        view, ref = self._observe(p, provider_said)
+        view, ref = self._observe(p)
         self.store.save_view(p, view)
+        # New facts are kept whatever happens to the state: a debit once seen stays seen.
+        facts: dict[str, Any] = {}
+        if ref and not p.provider_ref:
+            facts["provider_ref"] = ref
+        if isinstance(view["bank_debit"], int) and p.debited_paise is None:
+            facts["debited_paise"] = view["bank_debit"]
+
+        def move(to: State, detail: dict[str, Any]) -> Payment:
+            if to is p.state and not facts:
+                return p
+            return self._move(p, to, {**detail, "view": view}, **facts)
 
         if p.state is State.NEEDS_HUMAN:
             # A person owns it. Keep their facts current, but never change the state for them.
-            if ref and not p.provider_ref:
-                note = {"note": "provider reference found", "view": view}
-                return self._move(p, State.NEEDS_HUMAN, note, provider_ref=ref)
-            return p
+            return move(p.state, {"note": "new facts for the person handling it"})
 
-        target, why = _what_the_money_says(p, view)
-        if p.state is State.PROVIDER_ACCEPTED:
-            if target is not None:
-                return self._move(p, target, {"why": why, "view": view})
+        target, why = _what_the_money_says(p, view, self.clock())
+        if p.state in OPEN:
+            if target is not None and target is not p.state:
+                return move(target, {"why": why})
             if self.clock() - p.accepted_at > SETTLEMENT_DEADLINE:
-                why = "bank hasn't confirmed by the deadline"
-                return self._move(p, State.NEEDS_HUMAN, {"why": why, "view": view})
-            return p
+                return move(State.NEEDS_HUMAN, {"why": "bank hasn't confirmed the outcome by the deadline"})
+            return move(p.state, {"note": "still waiting for the bank"})
 
         # SETTLED or RETURNED, inside the watch window: has the picture changed since?
-        if target is not None and target is not p.state:
-            to = State.RETURNED if target is State.RETURNED else State.NEEDS_HUMAN
-            return self._move(p, to, {"why": f"changed after {p.state}: {why}", "view": view})
-        return p
+        if target in (None, State.PROVIDER_FAILED, p.state):
+            return move(p.state, {"note": "no change"})
+        to = State.RETURNED if target is State.RETURNED else State.NEEDS_HUMAN
+        return move(to, {"why": f"changed after {p.state}: {why}"})
 
-    def _observe(self, p: Payment, provider_said: str | None = None) -> tuple[dict[str, Any], str | None]:
+    def _observe(self, p: Payment) -> tuple[dict[str, Any], str | None]:
         """Ask every source about this payment. One source failing never blocks the others."""
-        if provider_said is not None:
-            provider: Any = ProviderStatus(provider_said, p.provider_ref)
-        else:
-            provider = _read(lambda: self.provider.lookup(p.idempotency_key))
+        provider = _read(lambda: self.provider.lookup(p.idempotency_key))
         found = provider if isinstance(provider, ProviderStatus) else None
         ref = p.provider_ref or (found.ref if found else None)
 
         def by_ref(fetch: Callable[[str], Any]) -> Any:
             return _read(lambda: fetch(ref)) if ref else "NO_REFERENCE"
 
+        # Ledger and settlement are shown to people. Only the bank feed and the provider decide anything.
         view = {
             "provider": found.state if found else provider,
             "ledger": _read(lambda: self.downstream.ledger_status(p.invoice_id)),
@@ -289,19 +315,25 @@ class PaymentService:
     def review_queue(self) -> list[dict[str, Any]]:
         """What a person in accounts payable or treasury should look at.
 
-        Every NEEDS_HUMAN payment; a HELD one straight away if its reasons need a person
-        (a bank change, a contradicting agent, a clock problem), otherwise once it has
-        been waiting longer than REVIEW_AFTER.
+        Every payment nothing automatic will move again (NEEDS_HUMAN, RETURNED, PROVIDER_REJECTED).
+        A HELD one straight away if its reasons need a person (a bank change, no verified account,
+        a contradicting agent, a clock problem), otherwise once it has waited longer than
+        REVIEW_AFTER. A NEW one that was never assessed, after REVIEW_AFTER.
         """
         now = self.clock()
         queue = []
-        for p in self.store.in_state(State.NEEDS_HUMAN):
-            queue.append({"invoice_id": p.invoice_id, "state": p.state, "why": [self._latest(p, "why")]})
+        for state in FOR_A_PERSON:
+            for p in self.store.in_state(state):
+                why = self._latest(p, "why") or LABELS[p.state]
+                queue.append({"invoice_id": p.invoice_id, "state": p.state, "why": [why]})
         for p in self.store.in_state(State.HELD):
             reasons = self._latest(p, "reasons") or []
             if {r["code"] for r in reasons} & REVIEW_NOW or now - p.created_at > REVIEW_AFTER:
                 why = [r["detail"] for r in reasons]
                 queue.append({"invoice_id": p.invoice_id, "state": p.state, "why": why})
+        for p in self.store.in_state(State.NEW):
+            if now - p.created_at > REVIEW_AFTER:
+                queue.append({"invoice_id": p.invoice_id, "state": p.state, "why": ["never assessed"]})
         return queue
 
     def _latest(self, p: Payment, key: str) -> Any:
@@ -314,27 +346,40 @@ class PaymentService:
         return moved or self.store.get(p.id)  # someone else moved it first; theirs stands
 
 
-def _what_the_money_says(p: Payment, view: Mapping[str, Any]) -> tuple[State | None, str]:
+def _what_the_money_says(p: Payment, view: Mapping[str, Any], now: datetime) -> tuple[State | None, str]:
     """Where the bank and the provider together put this payment. None: not known yet.
 
-    The bank decides. The provider's word only counts when the bank has nothing to contradict it.
+    The bank decides. The provider's word only counts once the bank has had time to contradict it.
     """
-    debit, back = view["bank_debit"], view["bank_return"]
-    provider_failed = view["provider"] in PROVIDER_FAILED
-    if isinstance(debit, int) and debit != p.amount_paise:
+    live = view["bank_debit"] if isinstance(view["bank_debit"], int) else None
+    debit = live if live is not None else p.debited_paise  # a debit once seen stays seen
+    back = view["bank_return"] if isinstance(view["bank_return"], int) else None
+    provider_failed = view["provider"] in FAILED_ANSWERS or p.state is State.PROVIDER_FAILED
+    if debit is not None and debit != p.amount_paise:
         return State.NEEDS_HUMAN, "bank debit amount differs from the payment"
-    if isinstance(back, int):
+    if back is not None:
         if back == p.amount_paise:
             return State.RETURNED, "bank shows the money came back"
         return State.NEEDS_HUMAN, "bank return amount differs from the payment"
-    if isinstance(debit, int):
+    if debit is not None:
         if provider_failed:
-            why = f"bank shows the debit but the provider says {view['provider']}, and nothing has come back"
+            why = "bank shows the debit, the provider says it failed, and nothing has come back"
             return State.NEEDS_HUMAN, why
         return State.SETTLED, "bank debit matches"
-    if provider_failed and debit == "NOT_SEEN":
-        return State.RETURNED, f"provider says {view['provider']} and the bank shows no debit"
+    if provider_failed:
+        if view["bank_debit"] == "NOT_SEEN" and now - p.accepted_at > BANK_FEED_LAG:
+            return State.RETURNED, f"provider says it failed and the bank has shown no debit in {BANK_FEED_LAG}"
+        return State.PROVIDER_FAILED, "provider says it failed; waiting for the bank to confirm"
     return None, "waiting for the bank"
+
+
+def _validate(req: PaymentRequest) -> None:
+    for name in ("invoice_id", "supplier_id", "agent_id"):
+        value = getattr(req, name)
+        if not isinstance(value, str) or not value.strip():
+            raise InvalidRequest(f"{name} must be a non-empty string, got {value!r}")
+    if type(req.amount_paise) is not int or req.amount_paise <= 0:
+        raise InvalidRequest(f"amount_paise must be a positive integer, got {req.amount_paise!r}")
 
 
 def _decision_detail(

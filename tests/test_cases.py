@@ -11,22 +11,7 @@ from payguard.scenario import AMOUNT, REQUEST, brief_evidence, resolved_evidence
 from payguard.service import ConflictingRequest
 from payguard.store import State
 
-KEY = "pay-INV-8842"
-
-
-def reason_codes(svc, payment) -> set[str]:
-    decision = next(e for e in reversed(svc.store.history(payment.id)) if "reasons" in e["detail"])
-    return {r["code"] for r in decision["detail"]["reasons"]}
-
-
-def evidence_with(**changes):
-    """Clean evidence with some sources replaced."""
-    def build(now):
-        evidence = resolved_evidence(now)
-        evidence.update({name: make(now) for name, make in changes.items()})
-        return evidence
-    return build
-
+from helpers import KEY, evidence_with, reason_codes
 
 # --- Case A: the same request arrives twice ------------------------------------
 
@@ -139,7 +124,7 @@ def test_brief_scenario_is_held_and_nothing_is_sent(world):
     p = svc.handle(REQUEST)
 
     assert p.state == State.HELD
-    assert reason_codes(svc, p) == {"BANK_CHANGE_PENDING", "STALE", "UNAVAILABLE", "AGENT_CLAIM_CONTRADICTED"}
+    assert reason_codes(svc) == {"BANK_CHANGE_PENDING", "STALE", "UNAVAILABLE", "AGENT_CLAIM_CONTRADICTED"}
     assert world.provider.pay_calls == []
 
 
@@ -152,7 +137,7 @@ def test_system_of_record_beats_the_agents_claim(world):
     p = svc.handle(REQUEST)
 
     assert p.state == State.REJECTED
-    assert {"INSUFFICIENT_BALANCE", "AGENT_CLAIM_CONTRADICTED"} <= reason_codes(svc, p)
+    assert {"INSUFFICIENT_BALANCE", "AGENT_CLAIM_CONTRADICTED"} <= reason_codes(svc)
     assert world.provider.pay_calls == []
 
 
@@ -165,7 +150,7 @@ def test_cached_compliance_clear_is_not_enough_when_the_service_is_down(world):
     svc = world.start()
     p = svc.handle(REQUEST)
     assert p.state == State.HELD
-    assert "UNAVAILABLE" in reason_codes(svc, p)
+    assert "UNAVAILABLE" in reason_codes(svc)
     assert world.provider.pay_calls == []
 
     # Compliance comes back and the agent re-sends: re-assessed, and paid exactly once.

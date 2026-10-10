@@ -49,7 +49,7 @@ To move to **REJECT**: the bank change turns out to be fraud, compliance returns
 
 - **Each fact has one system of record:** the vendor master owns bank details, procurement owns approval, the ledger owns balance. For its own fact, the system of record wins.
 - **The agent's claims rank last.** They never satisfy a check. When one contradicts a system of record, the record wins, the contradiction is logged, and the payment can't go through automatically (`AGENT_CLAIM_CONTRADICTED` in `decision.py`). An agent that's wrong about something I checked may be wrong about something I didn't.
-- **If two systems of record disagree about the same thing**, say procurement and the vendor master name different suppliers for the invoice, I don't pick one. No "latest wins" and no majority vote across systems. The payment holds and a person resolves it.
+- **If two systems of record disagree about the same thing**, I don't pick one. No "latest wins" and no majority vote across systems. The payment holds and a person resolves it. In the prototype every fact has a single owner, so this case doesn't arise. The nearest one is the request disagreeing with procurement on amount or supplier, and that is rejected, because the request isn't a system of record. The bank and the provider disagreeing about money is covered in Part 3.
 - **Stale, future-dated or unavailable data** can't satisfy a check, and it isn't treated as a "no" either. It means "unknown", and unknown means hold. (A timestamp in the future means a clock is wrong somewhere, so the data's age can't be known.)
 - Every decision is stored with what each source said and when, so a contradiction can be explained later.
 
@@ -78,7 +78,7 @@ What ties them together: **a timeout means the outcome is unknown, never that it
 
 ### 8. What I save before calling the provider
 
-One row, committed **before** the network call (write-ahead):
+The request is checked first: non-empty IDs, and the amount a positive whole number of paise. Then one row is committed **before** the network call (write-ahead):
 
 - the invoice id, the amount in paise (integers, never floats), and the supplier;
 - the **payee account as read from the vendor master** when the decision was made (the agent never chooses where money goes);
@@ -95,7 +95,7 @@ There are two different kinds of retry.
 - **The agent re-sends its request.** This is always safe: it gets the current state back. If the payment was on hold, it's assessed again with fresh evidence.
 - **We retry the provider call.** This happens only from `OUTCOME_UNKNOWN`, and only after asking the provider first:
   - If the lookup by key says ACCEPTED or REJECTED, I record that and stop.
-  - If it says NOT_FOUND, a resend is in effect a new payment, so **the evidence is checked again first**. If it still holds, I resend **with the same key**, and only inside a deadline that's well within the provider's dedupe window. If it no longer holds (delegation revoked, bank account changed), a person decides. It isn't put back on hold, because the first request may still land at the provider.
+  - If it says NOT_FOUND, a resend is in effect a new payment, so **the evidence is checked again first**. If it still holds, I resend **with the same key**, and only inside a deadline that's well within the provider's dedupe window. If it no longer holds (delegation revoked, bank account changed, a bank change pending), a person decides. It isn't put back on hold, because the first request may still land at the provider. If the gap may close on its own (a source briefly stale or down), it waits and tries again until the 30-minute deadline.
   - If the lookup itself fails, or gives an answer I don't recognise, I try again later with backoff (30 s, 1 min, 2 min, capped around 15 min, with jitter). After 30 minutes a person takes over.
 - **A definitive rejection** (account closed, invalid IFSC) is never retried.
 
@@ -105,7 +105,7 @@ Memory is gone, and the database says what's in flight. `run_pending()` runs at 
 
 - It finds rows stuck in `SUBMITTING`. If a row is older than the call timeout, it isn't a live call on another worker. It moves those rows to `OUTCOME_UNKNOWN`, because we can't know whether the call went out.
 - It resolves every `OUTCOME_UNKNOWN` row with the lookup described in question 9.
-- It reconciles every `PROVIDER_ACCEPTED` row (Part 3).
+- It reconciles every `PROVIDER_ACCEPTED` and `PROVIDER_FAILED` row (Part 3).
 - For 7 days it keeps re-checking `SETTLED` and `RETURNED` rows, in case money comes back or a late debit appears. It also keeps a `NEEDS_HUMAN` row's facts current, such as the UTR once the provider answers, without changing its state.
 - Each payment is handled on its own. One that raises is reported, and the rest carry on.
 
@@ -140,20 +140,23 @@ The provider says ACCEPTED, the ledger says PENDING, the settlement system is un
 
 `PROVIDER_ACCEPTED`, labelled **"Settlement pending: the provider has it, the bank hasn't confirmed the outcome. Do not retry or pay again."** It's neither "complete" nor "failed".
 
+If the provider says the payment failed, the state is `PROVIDER_FAILED` instead: "The provider says it failed. Waiting for the bank to confirm no money left."
+
 Next to it goes a view of each source: provider ACCEPTED, ledger PENDING, settlement UNAVAILABLE, bank debit NOT_SEEN, bank return NOT_SEEN (see `status()` in `service.py`). While a payment is in this state, the funds stay reserved, the invoice stays locked against manual payment, and nothing can retry it.
 
 ### 15. How I eventually find out what happened
 
 A reconciliation job (`_reconcile()`) re-reads every source by the payment's reference. It runs on a timer and whenever a webhook arrives. **The bank outranks the provider:**
 
-- **Bank debit matches the amount, and nothing has come back:** `SETTLED`. If the ledger is still PENDING, it catches up from the bank record, because the ledger is our books and the bank is where the money is.
+- **Bank debit matches the amount, and nothing has come back:** `SETTLED`. A debit once seen is stored on the payment, so it isn't forgotten when the statement feed's window rolls over.
 - **The bank shows the money came back** (a return credit for the amount): `RETURNED`. The funds are released, and paying again is a human decision.
-- **Provider says FAILED or RETURNED, and the bank shows no debit:** `RETURNED`.
+- **Provider says FAILED or RETURNED, and the bank shows no debit:** `PROVIDER_FAILED` until the bank feed has had 6 hours to show one, then `RETURNED`. A debit can appear in the feed hours after the provider answers.
 - **Provider says FAILED or RETURNED, but the bank shows the debit and nothing has come back:** `NEEDS_HUMAN`. Marking it returned would invite someone to pay again while the money is still out.
 - **Bank debit or return for the wrong amount:** `NEEDS_HUMAN`.
 - **Provider says SETTLED but there's no bank debit:** still pending. The provider's word doesn't settle it.
 - **After `SETTLED` or `RETURNED`**, it keeps checking for 7 days. A return after settlement, or a debit after a failure, moves the payment on or hands it to a person.
-- **If `pay()` itself answers FAILED,** the bank is checked straight away, so a failed payment is never shown as "settlement pending".
+- **If `pay()` itself answers FAILED,** the payment goes straight to `PROVIDER_FAILED`, so it's never shown as "settlement pending", and never called returned before the bank has had time.
+- **The ledger and the settlement system** are shown to the person but don't decide anything. The bank statement does. Posting the ledger entry from the bank record is a follow-up I left out.
 
 ### 16. If the disagreement never resolves
 
@@ -173,6 +176,7 @@ What I do about it: I resend only with the same key, and only within a deadline 
 
 - **A compromised system of record.** If an attacker gets the bank change approved in the vendor master, for example by fooling the approver, every check passes and the system pays the attacker. My system checks that sources are fresh and agree with each other. It can't check that they're right. Mitigation: a cooling-off period after any bank change (say 72 hours with a call-back), and a human approves the first payment to a new account.
 - **Evidence changing between the check and the payment.** I decide and send in one step, pay the account I read during the decision, and check the evidence again before any resend, but a small window remains. Closing it properly needs the vendor master to support a version check or a lock.
+- **A bank feed slower than I assumed.** A failed payment is called `RETURNED` once the feed has shown no debit for 6 hours. If a debit shows up later than that, the 7-day re-check hands it to a person, but someone could have re-paid in between. The 6 hours should come from the bank's real feed timings.
 - **Timestamps that lie.** A timestamp in the future is caught and held, but one that's merely wrong in the other direction isn't. "Updated 30 seconds ago" might be when a cache refreshed, not when the data underneath was true. If two "independent" sources read the same stale upstream, they'll agree and both be wrong.
 - **A check that's missing from the policy.** The system checks only what's on the list. An invoice that is approved but fraudulent in itself would pass.
 

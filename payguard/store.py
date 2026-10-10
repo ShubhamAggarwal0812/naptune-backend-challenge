@@ -26,6 +26,7 @@ class State(StrEnum):
     SUBMITTING = "SUBMITTING"                # committed before the provider call
     OUTCOME_UNKNOWN = "OUTCOME_UNKNOWN"      # call made, no answer: may or may not have executed
     PROVIDER_ACCEPTED = "PROVIDER_ACCEPTED"  # provider took it; the bank hasn't confirmed
+    PROVIDER_FAILED = "PROVIDER_FAILED"      # provider says it failed; the bank hasn't confirmed that
     PROVIDER_REJECTED = "PROVIDER_REJECTED"  # provider definitively didn't execute it
     SETTLED = "SETTLED"                      # bank debit seen for the exact amount
     RETURNED = "RETURNED"                    # failed or reversed after the provider accepted it
@@ -48,13 +49,14 @@ CREATE TABLE IF NOT EXISTS payments (
     payee_account   TEXT,                   -- from the vendor master at decision time
     state           TEXT NOT NULL,
     provider_ref    TEXT,
+    debited_paise   INTEGER,                -- bank debit once seen; it stays seen after the feed rolls over
     submitted_at    TEXT,
     accepted_at     TEXT,
     view            TEXT,                   -- latest per-source observations (Part 3)
     created_at      TEXT NOT NULL,
     updated_at      TEXT NOT NULL           -- time of the last state change
 );
-CREATE INDEX IF NOT EXISTS payments_by_state ON payments (state);
+CREATE INDEX IF NOT EXISTS payments_by_state ON payments (state, updated_at);
 CREATE TABLE IF NOT EXISTS events (
     id          INTEGER PRIMARY KEY,
     payment_id  INTEGER NOT NULL REFERENCES payments(id),
@@ -83,6 +85,7 @@ class Payment:
     payee_account: str | None
     state: State
     provider_ref: str | None
+    debited_paise: int | None
     submitted_at: datetime | None
     accepted_at: datetime | None
     updated_at: datetime
@@ -93,7 +96,7 @@ class Payment:
 class Store:
     _SETTABLE = frozenset({
         "supplier_id", "amount_paise", "agent_id",  # a newer request, before anything was sent
-        "payee_account", "provider_ref", "submitted_at", "accepted_at",
+        "payee_account", "provider_ref", "debited_paise", "submitted_at", "accepted_at",
     })
 
     def __init__(self, path: Path | str) -> None:
@@ -121,8 +124,13 @@ class Store:
                 detail = {"supplier_id": supplier_id, "amount_paise": amount_paise}
                 self._event(cur.lastrowid, None, State.NEW, detail, now)
         except sqlite3.IntegrityError:
+            if self.get_by_invoice(invoice_id) is None:
+                raise  # not a duplicate: some other constraint failed
             raise DuplicateInvoice(invoice_id) from None
         return self.get(cur.lastrowid)
+
+    def close(self) -> None:
+        self.conn.close()
 
     def get(self, payment_id: int) -> Payment:
         row = self.conn.execute("SELECT * FROM payments WHERE id = ?", (payment_id,)).fetchone()
@@ -134,9 +142,11 @@ class Store:
         ).fetchone()
         return _payment(row) if row else None
 
-    def in_state(self, state: State) -> list[Payment]:
+    def in_state(self, state: State, changed_since: datetime | None = None) -> list[Payment]:
+        """Payments in `state`, optionally only those whose state changed at or after `changed_since`."""
+        since = changed_since.isoformat() if changed_since else ""  # timestamps are all UTC ISO strings
         rows = self.conn.execute(
-            "SELECT * FROM payments WHERE state = ? ORDER BY id", (state,)
+            "SELECT * FROM payments WHERE state = ? AND updated_at >= ? ORDER BY id", (state, since)
         ).fetchall()
         return [_payment(r) for r in rows]
 
@@ -207,6 +217,7 @@ def _payment(row: sqlite3.Row) -> Payment:
         payee_account=row["payee_account"],
         state=State(row["state"]),
         provider_ref=row["provider_ref"],
+        debited_paise=row["debited_paise"],
         submitted_at=when(row["submitted_at"]),
         accepted_at=when(row["accepted_at"]),
         updated_at=datetime.fromisoformat(row["updated_at"]),

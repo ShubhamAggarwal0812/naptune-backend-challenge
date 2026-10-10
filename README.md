@@ -80,7 +80,7 @@ Each test drives the real service against the fakes and a real SQLite file. A "r
 | E: provider success, bank not yet | `test_provider_success_is_not_settlement` | ACCEPTED, and even a provider SETTLED, stays "settlement pending" until the bank debit appears. |
 | | `test_disagreement_that_never_resolves_goes_to_a_person_and_is_never_repaid` | After the deadline it goes to a person and is never paid again. |
 
-**A code review of the first version** found 15 problems. I reproduced each one and fixed it. Every fix that changes behaviour has a test in `tests/test_edge_cases.py` that fails on the old code. Paths the review found untested (a provider refusal, a debit for the wrong amount, two copies racing) now have tests too. The main problems:
+**Two code reviews** came after the first version. The first found 15 problems. I reproduced each one and fixed it. Every fix that changes behaviour has a test in `tests/test_edge_cases.py` that fails on the old code. Paths the review found untested (a provider refusal, a debit for the wrong amount, two copies racing) now have tests too. The main problems:
 
 - A provider "FAILED" was trusted over a bank debit showing the money had left. The bank now outranks the provider.
 - A resend after "not found" didn't check the evidence again, even 20 minutes later. Now it does, and a person decides if the evidence has changed.
@@ -89,11 +89,18 @@ Each test drives the real service against the fakes and a real SQLite file. A "r
 - Held payments never reached a person. There's now a review queue.
 - Smaller ones: evidence ages were measured before gathering finished, future-dated evidence passed as fresh, and a wrong first request locked the invoice for good.
 
-**To check the tests catch real mistakes,** I broke the code on purpose 22 ways, and at least one test failed each time:
+The second review, of the fixed version, found 15 more. Two of them came from the first round's fixes. Each was reproduced, fixed and tested the same way:
+
+- A supplier with no verified bank account was paid with no account at all. That's now a hold.
+- "Provider says it failed and the bank shows no debit" was treated as proof. It now waits 6 hours for the bank feed, in a new `PROVIDER_FAILED` state, and a debit once seen is stored so a rolled-over feed can't hide it.
+- Returned and rejected payments, and requests whose evidence couldn't even be gathered, never reached a person. They're in the review queue now.
+- Smaller ones: requests weren't validated, a brief data gap before a resend went straight to a person, a provider reference found later wasn't kept, and the losing copy in a race got the winner's payment back.
+
+**To check the tests catch real mistakes,** I broke the code on purpose 36 ways, and at least one test failed each time:
 
 - the 11 from the first version: treating a timeout as a failure, resending on a replayed request, resending without a lookup, using a new key on a resend, trusting the provider's SETTLED, ignoring staleness, using a cached result while a service is down, ignoring agent contradictions, ignoring a pending bank change, dropping the version check, and dropping the settlement deadline
 - sending after losing the race
-- one per review fix above
+- one per fix from each review (two for the race, one for each of its two code paths)
 
 **Tests I'd add against real systems:**
 
@@ -109,6 +116,7 @@ Each test drives the real service against the fakes and a real SQLite file. A "r
 - **The agent is untrusted input.** It names the invoice, supplier and amount. Where the money goes comes from the vendor master.
 - **Over the agent's ₹10L limit means REJECT** for the agent. Routing to the parent for approval would be a separate flow, which isn't modelled.
 - **Settlement deadline** is 24 hours, standing in for T+1 business day.
+- **The bank statement feed** shows a debit within 6 hours of the provider's answer. A failed payment is only called returned after that. The real number should come from the bank.
 - **SQLite stands in for Postgres.** The same UNIQUE constraint and `UPDATE … WHERE version = ?` work there. Each worker or thread opens its own `Store`, because SQLite connections refuse to be shared across threads.
 
 ## What I left out
@@ -116,11 +124,12 @@ Each test drives the real service against the fakes and a real SQLite file. A "r
 - **Reserving funds in the ledger** at send time. It's described in the answers, not built.
 - **Backoff scheduling.** `run_pending()` is meant to be called by a timer or a queue, and I didn't build the scheduler.
 - **Webhooks.** `_reconcile()` polls, and a webhook would just trigger it sooner.
+- **Posting the ledger entry** from the bank record once a payment settles. The ledger is shown, not updated.
 - **A screen for the review queue.** `review_queue()` lists what a person should look at, but there's no UI and no way to record their decision. Re-paying a returned payment is also left out.
 - **An HTTP API.** `PaymentService.handle()` is the entry point, and an API would map `ConflictingRequest` to a 409.
 
 ## AI tools used
 
-- **Claude Code** (Anthropic's coding agent for the terminal, running the Claude Opus 5.5 model). I gave it the brief. It wrote the reasoning in `docs/`, the code, the tests and this README, and set up the repository. I then ran its `/code-review` command on the whole repo. Claude Code reproduced each finding and fixed it. I reviewed all of it before submitting.
+- **Claude Code** (Anthropic's coding agent for the terminal, running the Claude Opus 5.5 model). I gave it the brief. It wrote the reasoning in `docs/`, the code, the tests and this README, and set up the repository. I then ran its `/code-review` command on the whole repo twice. Claude Code reproduced each finding and fixed it. I reviewed all of it before submitting.
 
 No other AI tools were used.

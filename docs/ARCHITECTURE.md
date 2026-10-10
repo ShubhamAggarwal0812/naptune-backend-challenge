@@ -43,11 +43,11 @@ In the prototype: `decision.py` is the decision engine, `service.py` holds the i
 
 | # | Where | What goes wrong | What the system does |
 |---|---|---|---|
-| F1 | Intake | The same request arrives twice, maybe at the same moment | `invoice_id` is UNIQUE, so the existing row is returned. A compare-and-set on `version` lets only one worker send. |
-| F2 | Evidence | A source is stale, future-dated or down, or the agent's claims contradict it | Hold. Such data never satisfies a check, and agent claims never count as evidence. A bank change or a contradiction puts it in the review queue straight away; any other hold joins after 4 hours. |
+| F1 | Intake | The same request arrives twice, maybe at the same moment, or a malformed one arrives | Requests are validated first. `invoice_id` is UNIQUE, so the existing row is returned. A compare-and-set on `version` lets only one worker send; a losing copy with a different amount gets a conflict. |
+| F2 | Evidence | A source is stale, future-dated, down or erroring, the supplier has no verified account, or the agent's claims contradict it | Hold. Such data never satisfies a check, and agent claims never count as evidence. A bank change or a contradiction puts it in the review queue straight away; any other hold joins after 4 hours. |
 | F3 | Provider call | Timeout after the provider executed | `OUTCOME_UNKNOWN`, then a lookup by key. A resend only ever uses the same key, and only after the evidence is checked again. |
 | F4 | Executor process | Crash between the write-ahead and the response | The row stays `SUBMITTING`. Recovery treats it as unknown and looks it up. |
-| F5 | Downstream | The provider says ACCEPTED, but the bank hasn't confirmed | `PROVIDER_ACCEPTED`, shown as "settlement pending". It's reconciled until the bank debit appears. Where the bank and the provider disagree, the bank wins, or a person decides. |
+| F5 | Downstream | The provider says ACCEPTED or FAILED, but the bank hasn't confirmed | `PROVIDER_ACCEPTED` ("settlement pending") or `PROVIDER_FAILED`. It's reconciled until the bank shows a debit, a return, or no debit for 6 hours. Where the bank and the provider disagree, the bank wins, or a person decides. |
 | F6 | Reconciler | The disagreement never resolves, or the money comes back after settling | `NEEDS_HUMAN` after a deadline. No automatic re-pay, and no automatic "complete". Settled and returned payments are watched for 7 days. |
 | F7 | Payments DB | It's down, or the write fails | No write-ahead means no provider call. The system fails closed. |
 | F8 | Between decision and payment | The bank details change after the check | The payment goes to the account captured at decision time, deciding and sending happen in one step, and a resend checks the evidence again. A small window remains (see the final questions). |
@@ -68,13 +68,18 @@ stateDiagram-v2
     REJECTED --> HELD: re-sent, evidence missing
     SUBMITTING --> PROVIDER_ACCEPTED: provider accepted
     SUBMITTING --> PROVIDER_REJECTED: provider refused
+    SUBMITTING --> PROVIDER_FAILED: provider says it failed
     SUBMITTING --> OUTCOME_UNKNOWN: timeout or crash
     OUTCOME_UNKNOWN --> PROVIDER_ACCEPTED: lookup found it
     OUTCOME_UNKNOWN --> PROVIDER_REJECTED: lookup says refused
+    OUTCOME_UNKNOWN --> PROVIDER_FAILED: lookup says it failed
     OUTCOME_UNKNOWN --> SUBMITTING: not found, evidence still OK, resend same key
     OUTCOME_UNKNOWN --> NEEDS_HUMAN: past deadline, or evidence changed
     PROVIDER_ACCEPTED --> SETTLED: bank debit matches
-    PROVIDER_ACCEPTED --> RETURNED: money came back, or provider failed and no debit
+    PROVIDER_ACCEPTED --> RETURNED: money came back
+    PROVIDER_ACCEPTED --> PROVIDER_FAILED: provider now says it failed, no debit
+    PROVIDER_FAILED --> RETURNED: no debit in 6h, or money came back
+    PROVIDER_FAILED --> NEEDS_HUMAN: a debit appears, or deadline
     PROVIDER_ACCEPTED --> NEEDS_HUMAN: deadline, wrong amount, or bank and provider disagree
     SETTLED --> RETURNED: money came back within 7 days
     SETTLED --> NEEDS_HUMAN: provider reports a return, nothing back yet
